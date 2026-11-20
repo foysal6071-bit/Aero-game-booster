@@ -7,6 +7,9 @@ on:
 permissions:
   contents: write
 
+env:
+  APP_NAME: GameBoost
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -15,29 +18,107 @@ jobs:
 
       - name: Unzip project
         run: |
-          ZIP=$(ls *.zip | head -n 1)
-          mkdir project
-          unzip -q "$ZIP" -d project
+          set -e
+          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ZIP=$(find . -maxdepth 2 -type f -iname '*.zip' -not -path './.git/*' | head -n 1)
+          if [ -z "$ZIP" ]; then echo "No zip file found in the repository."; ls -la; exit 1; fi
+          echo "Using zip: $ZIP"
+          rm -rf project && mkdir project
+          unzip -q -o "$ZIP" -d project -x "__MACOSX/*" "*.DS_Store"
+          SETTINGS=$(find project -maxdepth 4 -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1)
+          if [ -z "$SETTINGS" ]; then echo "settings.gradle not found in zip"; find project | head -50; exit 1; fi
+          DIR=$(dirname "$SETTINGS")
+          echo "Project root: $DIR"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - uses: gradle/actions/setup-gradle@v3
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
 
-      - name: Build APK
-        working-directory: project
-        run: gradle assembleDebug
+      # Optional: your own key from repository secrets (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD).
+      # Without it a temporary key is used, so each build installs as a separate version (no in-place update).
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          if [ -f ./gradlew ]; then chmod +x ./gradlew; G=./gradlew; else G=gradle; fi
+          $G --no-daemon --console=plain assembleDebug 2>&1 | tee build-debug.log
 
-      - name: Rename APK
-        run: cp project/app/build/outputs/apk/debug/app-debug.apk GameBoost.apk
+      # If the optimized build fails, the debug APK is still released.
+      - name: Build release APK (optimized)
+        id: relbuild
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          if [ -f ./gradlew ]; then G=./gradlew; else G=gradle; fi
+          $G --no-daemon --console=plain assembleRelease 2>&1 | tee build-release.log
+
+      - name: Show errors only
+        if: failure() || steps.relbuild.outcome == 'failure'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          echo "=============== ERRORS ==============="
+          cat build-*.log | grep -nE "^e: |error:|What went wrong|Execution failed|Could not|Duplicate class|Missing class|R8" -A4 | head -100
+
+      - name: Collect & sign APKs
+        id: apk
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          OUTDIR="${{ env.PROJECT_DIR }}/app/build/outputs/apk"
+          DBG=$(find "$OUTDIR/debug" -type f -name '*.apk' 2>/dev/null | head -n 1)
+          REL=$(find "$OUTDIR/release" -type f -name '*.apk' 2>/dev/null | head -n 1)
+          if [ -z "$DBG" ] && [ -z "$REL" ]; then
+            echo "No APK found. Build outputs:"; find "$OUTDIR" | head -40; exit 1
+          fi
+
+          if [ -n "$DBG" ]; then
+            cp "$DBG" "${APP_NAME}-v${{ github.run_number }}-debug.apk"
+            echo "debug=${APP_NAME}-v${{ github.run_number }}-debug.apk" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$REL" ]; then
+            OUT="${APP_NAME}-v${{ github.run_number }}.apk"
+            BT=$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n1)
+            APKSIGNER="$ANDROID_HOME/build-tools/$BT/apksigner"
+            if "$APKSIGNER" verify "$REL" >/dev/null 2>&1; then
+              cp "$REL" "$OUT"
+            else
+              if [ -n "$KEYSTORE_B64" ]; then
+                echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+                KP="$KEYSTORE_PASSWORD"; KA="${KEY_ALIAS:-release}"; KKP="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+              else
+                echo "::warning::Release APK is unsigned and no KEYSTORE_BASE64 secret is set - signing with a temporary key (no in-place updates)."
+                KP="android123"; KA="release"; KKP="android123"
+                keytool -genkeypair -keystore "$RUNNER_TEMP/release.keystore" -storepass "$KP" -keypass "$KKP" \
+                  -alias "$KA" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=${APP_NAME}"
+              fi
+              "$APKSIGNER" sign --ks "$RUNNER_TEMP/release.keystore" --ks-pass "pass:$KP" --ks-key-alias "$KA" \
+                --key-pass "pass:$KKP" --out "$OUT" "$REL"
+            fi
+            echo "release=$OUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No optimized release APK was produced - only the debug APK will be released."
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
           name: Game Boost v${{ github.run_number }}
-          files: GameBoost.apk
+          generate_release_notes: true
+          files: |
+            ${{ steps.apk.outputs.release }}
+            ${{ steps.apk.outputs.debug }}
